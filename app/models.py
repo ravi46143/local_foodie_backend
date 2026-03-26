@@ -57,6 +57,21 @@ class Chef(Base):
     daily_meals = Column(String(50), nullable=False)
     cuisine_type = Column(String(100), nullable=False)
     food_category = Column(String(100), nullable=False)
+    
+    # Detailed address
+    area = Column(String(255), nullable=True)
+    city = Column(String(100), nullable=True)
+    state = Column(String(100), nullable=True)
+    pincode = Column(String(10), nullable=True)
+
+    # Business details
+    pricing = Column(Float, default=0.0)
+    availability = Column(Text, nullable=True) # JSON or descriptive string
+    service_radius = Column(Float, default=5.0) # In km
+    opening_time = Column(String(10), nullable=True) # e.g. "09:00 AM"
+    closing_time = Column(String(10), nullable=True)
+    specialities = Column(Text, nullable=True)
+    fssai_number = Column(String(50), nullable=True)
 
     # Relationships
     dishes = relationship("Dish", back_populates="chef")
@@ -107,8 +122,42 @@ class Order(Base):
     status = Column(String(50), default="pending")
     total_amount = Column(Float, nullable=False)
     customer_rating = Column(Float, nullable=True)
-    customer_note = Column(Text, nullable=True)
+    customer_note = Column(Text, nullable=True) # Keep for backward compatibility
+    special_instructions = Column(Text, nullable=True)
+    payment_method = Column(String(100), nullable=True)
+    address_id = Column(Integer, ForeignKey("addresses.id"), nullable=True)
+    delivery_address = Column(String(255), nullable=True)
+    landmark = Column(String(255), nullable=True)
+    area = Column(String(100), nullable=True)
+    city = Column(String(100), nullable=True)
+    state = Column(String(100), nullable=True)
+    pincode = Column(String(20), nullable=True)
+    latitude = Column(Float, nullable=True)
+    longitude = Column(Float, nullable=True)
+    customer_name = Column(String(100), nullable=True)
+    customer_phone = Column(String(20), nullable=True)
+    delivery_fee = Column(Float, default=0.0)
+    platform_fee = Column(Float, default=0.0)
+    package_fee = Column(Float, default=10.0)
+    chef_earnings = Column(Float, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+    # Status transition timestamps
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    accepted_at = Column(DateTime, nullable=True)
+    preparing_at = Column(DateTime, nullable=True)
+    ready_at = Column(DateTime, nullable=True)
+    out_for_delivery_at = Column(DateTime, nullable=True)
+    delivered_at = Column(DateTime, nullable=True)
+
+    # Real-time tracking fields
+    current_latitude = Column(Float, nullable=True)
+    current_longitude = Column(Float, nullable=True)
+    destination_latitude = Column(Float, nullable=True)
+    destination_longitude = Column(Float, nullable=True)
+    tracking_enabled = Column(Boolean, default=False)
+    last_location_updated_at = Column(DateTime, nullable=True)
+    estimated_arrival_minutes = Column(Integer, nullable=True)
+    remaining_distance_km = Column(Float, nullable=True)
 
     # Relationships
     customer = relationship("User", back_populates="orders")
@@ -141,6 +190,8 @@ class Address(Base):
     pincode = Column(String(20), nullable=True)
     latitude = Column(Float, nullable=True)
     longitude = Column(Float, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     # Relationships
     user = relationship("User", back_populates="addresses")
@@ -176,3 +227,27 @@ class PasswordReset(Base):
     otp = Column(String(6), nullable=False)
     expires_at = Column(DateTime, nullable=False)
     is_verified = Column(Boolean, default=False)
+
+class Cart(Base):
+    __tablename__ = "carts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), unique=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow)
+
+    items = relationship("CartItem", back_populates="cart", cascade="all, delete-orphan")
+
+
+class CartItem(Base):
+    __tablename__ = "cart_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    cart_id = Column(Integer, ForeignKey("carts.id"), nullable=False)
+    dish_id = Column(Integer, ForeignKey("dishes.id"), nullable=False)
+    quantity = Column(Integer, nullable=False, default=1)
+    price = Column(Float, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    cart = relationship("Cart", back_populates="items")
+    dish = relationship("Dish")

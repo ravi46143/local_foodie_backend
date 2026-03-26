@@ -4,19 +4,24 @@ import shutil
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 from fastapi import Depends
-from fastapi import FastAPI, Depends, HTTPException, status, Query, File, UploadFile
+from fastapi import FastAPI, Depends, HTTPException, status, Query, File, UploadFile, WebSocket, WebSocketDisconnect
+from collections import defaultdict
+from fastapi.exceptions import RequestValidationError
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from .database import engine, SessionLocal, get_db
-from .models import Base, User, Chef, Dish, Order, OrderItem, Wallet, Transaction, Review, Address, PasswordReset
+from .models import Base, User, Chef, Dish, Order, OrderItem, Wallet, Transaction, Review, Address, PasswordReset, Cart, CartItem
 from .schemas import (
     CustomerRegister, CustomerResponse, CustomerLogin, LoginResponse,
     ChefResponse, DishResponse, OrderCreate, OrderResponse, WalletResponse,
     ReviewCreate, ReviewResponse, ChefOnboard, ChefDashboardStats, ImageResponse,
     OrderStatusUpdate, OrderRatingRequest, ChefLogin, ChefLoginResponse, AddressCreate, AddressResponse,
     ForgotPasswordRequest, VerifyOTPRequest, ResetPasswordRequest,
-    UpdateCustomerProfileRequest, UpdateChefProfileRequest
+    UpdateCustomerProfileRequest, UpdateChefProfileRequest,
+    CustomerDetail, AddressDetail, OrderItemDetail, OrderDetailResponse,
+    GenericAddressResponse, GenericAddressListResponse,
+    CartItemCreate, CartItemUpdate, CartItemResponse, CartResponse, AddToCartRequest
 )
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timedelta
@@ -58,6 +63,88 @@ def calculate_distance(lat1, lon1, lat2, lon2):
 # App Initialization
 # -------------------------
 app = FastAPI(title="Local Foodies API")
+
+class ConnectionManager:
+    def __init__(self):
+        # Dictionary mapping order_id to list of WebSocket connections for tracking
+        self.order_connections: Dict[str, List[WebSocket]] = {}
+        # Dictionary mapping user_id to list of WebSocket connections for cart updates
+        self.cart_connections: Dict[int, List[WebSocket]] = defaultdict(list)
+
+    async def connect_order(self, websocket: WebSocket, order_id: str):
+        await websocket.accept()
+        if order_id not in self.order_connections:
+            self.order_connections[order_id] = []
+        self.order_connections[order_id].append(websocket)
+
+    def disconnect_order(self, websocket: WebSocket, order_id: str):
+        if order_id in self.order_connections:
+            if websocket in self.order_connections[order_id]:
+                self.order_connections[order_id].remove(websocket)
+                if not self.order_connections[order_id]:
+                    del self.order_connections[order_id]
+
+    async def connect_cart(self, websocket: WebSocket, user_id: int):
+        await websocket.accept()
+        self.cart_connections[user_id].append(websocket)
+
+    def disconnect_cart(self, websocket: WebSocket, user_id: int):
+        if user_id in self.cart_connections:
+            if websocket in self.cart_connections[user_id]:
+                self.cart_connections[user_id].remove(websocket)
+
+    async def send_order_update(self, order_id: str, message: dict):
+        if order_id in self.order_connections:
+            for connection in self.order_connections[order_id]:
+                try:
+                    await connection.send_json(message)
+                except Exception as e:
+                    print(f"Error sending Order WS message: {e}")
+
+    async def send_cart_update(self, user_id: int, data: dict):
+        if user_id in self.cart_connections:
+            for connection in self.cart_connections[user_id]:
+                try:
+                    await connection.send_json(data)
+                except Exception as e:
+                    print(f"Error sending Cart WS message: {e}")
+
+manager = ConnectionManager()
+
+from fastapi.responses import JSONResponse
+import traceback
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request, exc):
+    errors = exc.errors()
+    # Simplified error message extraction
+    first_error = errors[0]
+    field = ".".join([str(p) for p in first_error.get("loc", [])])
+    msg = first_error.get("msg", "Invalid input")
+    
+    # Custom messages for our regex
+    if "pattern" in msg or "value_error.str.regex" in msg:
+        if "full_name" in field or "kitchen_name" in field:
+            msg = "Name should contain only alphabets"
+        elif "phone" in field:
+            msg = "Enter a valid 10-digit mobile number"
+    
+    return JSONResponse(
+        status_code=422,
+        content={
+            "success": False,
+            "message": f"Validation Error: {msg}"
+        }
+    )
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    print(f"GLOBAL ERROR: {traceback.format_exc()}")
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "An internal server error occurred. Please check logs."}
+    )
 
 # Add CORS Middleware
 app.add_middleware(
@@ -294,6 +381,17 @@ def onboard_chef(data: ChefOnboard, db: Session = Depends(get_db)):
         experience=data.experience,
         daily_meals=data.daily_meals,
         address=data.address,
+        area=data.area,
+        city=data.city,
+        state=data.state,
+        pincode=data.pincode,
+        pricing=data.pricing,
+        availability=data.availability,
+        service_radius=data.service_radius,
+        opening_time=data.opening_time,
+        closing_time=data.closing_time,
+        specialities=data.specialities,
+        fssai_number=data.fssai_number,
         latitude=data.latitude,
         longitude=data.longitude,
         image_url=data.image_url,
@@ -421,10 +519,165 @@ def create_review(review: ReviewCreate, user_id: int, db: Session = Depends(get_
 # Dish creation is handled above at line 133
 
 # -------------------------
+# Cart APIs
+# -------------------------
+def get_or_create_cart(db: Session, user_id: int):
+    cart = db.query(Cart).filter(Cart.user_id == user_id).first()
+    if not cart:
+        cart = Cart(user_id=user_id)
+        db.add(cart)
+        db.commit()
+        db.refresh(cart)
+    return cart
+
+def build_cart_response(cart: Cart):
+    items = []
+    total = 0.0
+
+    for item in cart.items:
+        dish_name = item.dish.name if item.dish else "Unknown Dish"
+        image_url = item.dish.image_url if item.dish else None
+        total += item.price * item.quantity
+
+        items.append({
+            "id": item.id,
+            "dish_id": item.dish_id,
+            "dish_name": dish_name,
+            "quantity": item.quantity,
+            "price": item.price,
+            "image_url": image_url
+        })
+
+    return {
+        "user_id": cart.user_id,
+        "items": items,
+        "total_amount": total
+    }
+
+@app.post("/cart/add", response_model=CartResponse)
+async def add_to_cart(data: AddToCartRequest, db: Session = Depends(get_db)):
+    dish = db.query(Dish).filter(Dish.id == data.dish_id).first()
+    if not dish:
+        raise HTTPException(status_code=404, detail="Dish not found")
+
+    cart = get_or_create_cart(db, data.user_id)
+
+    existing_item = db.query(CartItem).filter(
+        CartItem.cart_id == cart.id,
+        CartItem.dish_id == data.dish_id
+    ).first()
+
+    if existing_item:
+        existing_item.quantity += data.quantity
+    else:
+        existing_item = CartItem(
+            cart_id=cart.id,
+            dish_id=data.dish_id,
+            quantity=data.quantity,
+            price=dish.price
+        )
+        db.add(existing_item)
+
+    cart.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(cart)
+
+    response = build_cart_response(cart)
+    await manager.send_cart_update(data.user_id, {
+        "type": "cart_updated",
+        "cart": response
+    })
+
+    return response
+
+@app.get("/cart/{user_id}", response_model=CartResponse)
+def get_cart(user_id: int, db: Session = Depends(get_db)):
+    cart = get_or_create_cart(db, user_id)
+    return build_cart_response(cart)
+
+@app.put("/cart/item/{cart_item_id}", response_model=CartResponse)
+async def update_cart_item(cart_item_id: int, data: CartItemUpdate, db: Session = Depends(get_db)):
+    cart_item = db.query(CartItem).filter(CartItem.id == cart_item_id).first()
+    if not cart_item:
+        raise HTTPException(status_code=404, detail="Cart item not found")
+
+    if data.quantity <= 0:
+        db.delete(cart_item)
+        db.commit()
+        cart = db.query(Cart).filter(Cart.id == cart_item.cart_id).first()
+    else:
+        cart_item.quantity = data.quantity
+        cart = db.query(Cart).filter(Cart.id == cart_item.cart_id).first()
+        cart.updated_at = datetime.utcnow()
+        db.commit()
+
+    db.refresh(cart)
+    response = build_cart_response(cart)
+
+    await manager.send_cart_update(cart.user_id, {
+        "type": "cart_updated",
+        "cart": response
+    })
+
+    return response
+
+@app.delete("/cart/item/{cart_item_id}", response_model=CartResponse)
+async def remove_cart_item(cart_item_id: int, db: Session = Depends(get_db)):
+    cart_item = db.query(CartItem).filter(CartItem.id == cart_item_id).first()
+    if not cart_item:
+        raise HTTPException(status_code=404, detail="Cart item not found")
+
+    cart = db.query(Cart).filter(Cart.id == cart_item.cart_id).first()
+    user_id = cart.user_id
+
+    db.delete(cart_item)
+    cart.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(cart)
+
+    response = build_cart_response(cart)
+
+    await manager.send_cart_update(user_id, {
+        "type": "cart_updated",
+        "cart": response
+    })
+
+    return response
+
+@app.delete("/cart/clear/{user_id}", response_model=CartResponse)
+async def clear_cart(user_id: int, db: Session = Depends(get_db)):
+    cart = get_or_create_cart(db, user_id)
+
+    for item in cart.items:
+        db.delete(item)
+
+    cart.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(cart)
+
+    response = build_cart_response(cart)
+
+    await manager.send_cart_update(user_id, {
+        "type": "cart_updated",
+        "cart": response
+    })
+
+    return response
+
+@app.websocket("/ws/cart/{user_id}")
+async def cart_websocket(websocket: WebSocket, user_id: int):
+    await manager.connect_cart(websocket, user_id)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect_cart(websocket, user_id)
+
+# -------------------------
 # Order APIs
 # -------------------------
 @app.post("/orders", response_model=OrderResponse)
-def create_order(order: OrderCreate, current_user_id: int, db: Session = Depends(get_db)):
+async def create_order(order: OrderCreate, current_user_id: int, db: Session = Depends(get_db)):
     total = 0.0
     db_items = []
 
@@ -436,11 +689,55 @@ def create_order(order: OrderCreate, current_user_id: int, db: Session = Depends
         db_items.append(OrderItem(dish_id=item.dish_id, quantity=item.quantity, price=dish.price))
 
     # Create order first (COD - no wallet check required)
+    package_fee = 10.0
+    final_total = total + package_fee
+    chef_earnings = total # Chef gets the item total entirely
+
+    # Handle Wallet Payment
+    if order.payment_method == "Wallet":
+        wallet = db.query(Wallet).filter(Wallet.user_id == current_user_id).first()
+        if not wallet or wallet.balance < final_total:
+            raise HTTPException(status_code=400, detail="Insufficient wallet balance")
+        
+        # Deduct balance
+        wallet.balance -= final_total
+        db.add(wallet)
+        
+        # Log transaction
+        tx = Transaction(
+            wallet_id=wallet.user_id,
+            amount=final_total,
+            type="debit",
+            description=f"Payment for order (Chef ID: {order.chef_id})"
+        )
+        db.add(tx)
+    
     new_order = Order(
         user_id=current_user_id,
         chef_id=order.chef_id,
-        total_amount=total,
-        status="pending"
+        total_amount=final_total,
+        status="pending",
+        customer_note=order.special_instructions or order.customer_note,
+        special_instructions=order.special_instructions or order.customer_note,
+        payment_method=order.payment_method,
+        address_id=order.address_id,
+        delivery_address=order.delivery_address,
+        landmark=order.landmark,
+        area=order.area,
+        city=order.city,
+        state=order.state,
+        pincode=order.pincode,
+        latitude=order.latitude,
+        longitude=order.longitude,
+        customer_name=order.customer_name,
+        customer_phone=order.customer_phone,
+        delivery_fee=0.0,
+        platform_fee=0.0,
+        package_fee=package_fee,
+        chef_earnings=chef_earnings,
+        destination_latitude=order.latitude,
+        destination_longitude=order.longitude,
+        tracking_enabled=True # Enable tracking for new orders
     )
     db.add(new_order)
     db.commit()
@@ -452,6 +749,21 @@ def create_order(order: OrderCreate, current_user_id: int, db: Session = Depends
 
     db.commit()
     db.refresh(new_order)
+
+    # Clear user's cart after successful order
+    cart = db.query(Cart).filter(Cart.user_id == current_user_id).first()
+    if cart:
+        for item in cart.items:
+            db.delete(item)
+        db.commit()
+        
+        # Send WebSocket update for cleared cart
+        response = build_cart_response(cart)
+        await manager.send_cart_update(current_user_id, {
+            "type": "cart_updated",
+            "cart": response
+        })
+
     return new_order
 
 @app.get("/orders/history", response_model=List[OrderResponse])
@@ -463,15 +775,158 @@ def get_chef_orders(chef_id: int, db: Session = Depends(get_db)):
     return db.query(Order).filter(Order.chef_id == chef_id).order_by(Order.created_at.desc()).all()
 
 @app.patch("/orders/{order_id}/status", response_model=OrderResponse)
-def update_order_status(order_id: int, data: OrderStatusUpdate, db: Session = Depends(get_db)):
+async def update_order_status(order_id: int, data: OrderStatusUpdate, db: Session = Depends(get_db)):
     db_order = db.query(Order).filter(Order.id == order_id).first()
     if not db_order:
         raise HTTPException(status_code=404, detail="Order not found")
-    
-    db_order.status = data.status.lower()
+
+    new_status = data.status.lower()
+    now = datetime.utcnow()
+
+    db_order.status = new_status
+    db_order.updated_at = now
+
+    # Store exact timestamp for each status transition
+    if new_status == "accepted":
+        db_order.accepted_at = now
+    elif new_status == "preparing":
+        db_order.preparing_at = now
+    elif new_status == "ready":
+        db_order.ready_at = now
+    elif new_status == "out_for_delivery":
+        db_order.out_for_delivery_at = now
+    elif new_status == "delivered":
+        db_order.delivered_at = now
+
     db.commit()
     db.refresh(db_order)
+
+    # Notify via WebSocket
+    await manager.send_order_update(str(order_id), {
+        "type": "order_status_updated",
+        "order_id": order_id,
+        "status": new_status,
+        "timestamp": now.isoformat()
+    })
+
     return db_order
+
+@app.patch("/orders/{order_id}/location", response_model=OrderResponse)
+async def update_order_location(order_id: int, data: OrderLocationUpdate, db: Session = Depends(get_db)):
+    db_order = db.query(Order).filter(Order.id == order_id).first()
+    if not db_order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    now = datetime.utcnow()
+    db_order.current_latitude = data.latitude
+    db_order.current_longitude = data.longitude
+    db_order.last_location_updated_at = now
+    
+    if data.estimated_arrival_minutes is not None:
+        db_order.estimated_arrival_minutes = data.estimated_arrival_minutes
+    if data.remaining_distance_km is not None:
+        db_order.remaining_distance_km = data.remaining_distance_km
+
+    # Simple logic to update status to "near_you" if close
+    if db_order.destination_latitude and db_order.destination_longitude:
+        dist = calculate_distance(data.latitude, data.longitude, 
+                                  db_order.destination_latitude, db_order.destination_longitude)
+        if dist < 0.5 and db_order.status == "out_for_delivery":
+             db_order.status = "near_you"
+
+    db.commit()
+    db.refresh(db_order)
+
+    # Notify via WebSocket
+    await manager.send_order_update(str(order_id), {
+        "type": "driver_location_updated",
+        "order_id": order_id,
+        "latitude": data.latitude,
+        "longitude": data.longitude,
+        "eta": db_order.estimated_arrival_minutes,
+        "distance": db_order.remaining_distance_km,
+        "status": db_order.status
+    })
+
+    return db_order
+
+@app.websocket("/ws/orders/{order_id}")
+async def order_websocket(websocket: WebSocket, order_id: str):
+    await manager.connect_order(websocket, order_id)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect_order(websocket, order_id)
+
+@app.get("/orders/{order_id}", response_model=OrderDetailResponse)
+def get_order_details(order_id: int, db: Session = Depends(get_db)):
+    db_order = db.query(Order).filter(Order.id == order_id).first()
+    if not db_order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    chef = db.query(Chef).filter(Chef.id == db_order.chef_id).first()
+    user = db.query(User).filter(User.id == db_order.user_id).first()
+
+    items = []
+    for item in db_order.items:
+        dish = db.query(Dish).filter(Dish.id == item.dish_id).first()
+        items.append(OrderItemDetail(
+            dish_name=dish.name if dish else "Unknown Dish",
+            quantity=item.quantity,
+            price=item.price
+        ))
+
+    return OrderDetailResponse(
+        id=db_order.id,
+        status=db_order.status,
+        total_amount=db_order.total_amount,
+        created_at=db_order.created_at,
+        updated_at=db_order.updated_at,
+        accepted_at=db_order.accepted_at,
+        preparing_at=db_order.preparing_at,
+        out_for_delivery_at=db_order.out_for_delivery_at,
+        delivered_at=db_order.delivered_at,
+        customer=CustomerDetail(
+            name=user.full_name if user else db_order.customer_name or "Customer",
+            phone=user.phone if user else db_order.customer_phone or "",
+            email=user.email if user else ""
+        ),
+        delivery_address_obj=AddressDetail(
+            address_line=db_order.delivery_address,
+            landmark=db_order.landmark,
+            area=db_order.area,
+            city=db_order.city,
+            state=db_order.state,
+            pincode=db_order.pincode,
+            latitude=db_order.latitude,
+            longitude=db_order.longitude
+        ),
+        delivery_address=db_order.delivery_address,
+        items=items,
+        customer_note=db_order.special_instructions or db_order.customer_note,
+        special_instructions=db_order.special_instructions or db_order.customer_note,
+        payment_method=db_order.payment_method or "COD",
+        address_id=db_order.address_id,
+        kitchen_name=chef.kitchen_name if chef else "Home Kitchen",
+        chef_phone=chef.phone if chef else "",
+        delivery_fee=0.0,
+        platform_fee=0.0,
+        customer_name=db_order.customer_name or (user.full_name if user else "Customer"),
+        customer_phone=db_order.customer_phone or (user.phone if user else ""),
+        customer_email=user.email if user else "",
+        
+        # Tracking fields
+        current_latitude=db_order.current_latitude,
+        current_longitude=db_order.current_longitude,
+        destination_latitude=db_order.destination_latitude,
+        destination_longitude=db_order.destination_longitude,
+        tracking_enabled=db_order.tracking_enabled,
+        last_location_updated_at=db_order.last_location_updated_at,
+        estimated_arrival_minutes=db_order.estimated_arrival_minutes,
+        remaining_distance_km=db_order.remaining_distance_km,
+        ready_at=db_order.ready_at
+    )
 
 @app.post("/orders/{order_id}/rate", response_model=OrderResponse)
 def rate_order(order_id: int, data: OrderRatingRequest, db: Session = Depends(get_db)):
@@ -576,34 +1031,50 @@ def get_wallet(user_id: int, db: Session = Depends(get_db)):
 # -------------------------
 # Address APIs
 # -------------------------
-@app.get("/addresses/{user_id}", response_model=List[AddressResponse])
+@app.get("/addresses/{user_id}", response_model=GenericAddressListResponse)
 def get_addresses(user_id: int, db: Session = Depends(get_db)):
-    return db.query(Address).filter(Address.user_id == user_id).all()
+    addresses = db.query(Address).filter(Address.user_id == user_id).all()
+    return {
+        "success": True,
+        "message": "Addresses fetched successfully",
+        "addresses": addresses
+    }
 
-@app.post("/addresses", response_model=AddressResponse)
+
+@app.post("/addresses", response_model=GenericAddressResponse)
 def add_address(address: AddressCreate, db: Session = Depends(get_db)):
-    db_address = Address(
-        user_id=address.user_id,
-        label=address.label,
-        address_line=address.address_line,
-        landmark=address.landmark,
-        area=address.area,
-        city=address.city,
-        state=address.state,
-        pincode=address.pincode,
-        latitude=address.latitude,
-        longitude=address.longitude
-    )
-    db.add(db_address)
-    db.commit()
-    db.refresh(db_address)
-    return db_address
+    try:
+        db_address = Address(
+            user_id=address.user_id,
+            label=address.label,
+            address_line=address.address_line,
+            landmark=address.landmark,
+            area=address.area,
+            city=address.city,
+            state=address.state,
+            pincode=address.pincode,
+            latitude=address.latitude,
+            longitude=address.longitude
+        )
+        db.add(db_address)
+        db.commit()
+        db.refresh(db_address)
+        return {
+            "success": True,
+            "message": "Address added successfully",
+            "address": db_address
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 # -------------------------
 # Image Upload API
 # -------------------------
+from fastapi import Request
+
 @app.post("/upload", response_model=ImageResponse)
-async def upload_image(image: UploadFile = File(...)):
+async def upload_image(request: Request, image: UploadFile = File(...)):
     try:
         filename = f"{datetime.now().strftime('%Y%m%d%H%M%S')}_{image.filename}"
         file_path = os.path.join(UPLOAD_DIR, filename)
@@ -611,12 +1082,50 @@ async def upload_image(image: UploadFile = File(...)):
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(image.file, buffer)
             
-        # Replace with your current machine IP (found via ipconfig)
-        image_url = f"http://10.164.109.239:8000/uploads/{filename}"
+        # Use request.base_url to handle IP changes automatically
+        base_url = str(request.base_url).rstrip("/")
+        image_url = f"{base_url}/uploads/{filename}"
         
         return {"image_url": image_url, "message": "Image uploaded successfully"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Image upload failed: {str(e)}")
+
+# -------------------------
+# Profile Fetch APIs
+# -------------------------
+@app.get("/customer/profile/{user_id}")
+def get_customer_profile(user_id: int, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    wallet = db.query(Wallet).filter(Wallet.user_id == user_id).first()
+    wallet_balance = wallet.balance if wallet else 0.0
+    
+    return {
+        "id": user.id,
+        "full_name": user.full_name,
+        "email": user.email,
+        "phone": user.phone,
+        "role": user.role,
+        "wallet_balance": wallet_balance,
+        "created_at": user.created_at
+    }
+
+@app.get("/chef/profile/{chef_id}", response_model=ChefResponse)
+def get_chef_profile(chef_id: int, db: Session = Depends(get_db)):
+    chef = db.query(Chef).filter(Chef.id == chef_id).first()
+    if not chef:
+        raise HTTPException(status_code=404, detail="Chef not found")
+    
+    # Include wallet balance if chef has one (users linked)
+    user = db.query(User).filter(User.email == chef.email).first()
+    wallet_balance = 0.0
+    if user:
+        wallet = db.query(Wallet).filter(Wallet.user_id == user.id).first()
+        wallet_balance = wallet.balance if wallet else 0.0
+
+    return chef
 
 # -------------------------
 # Profile Update APIs
@@ -649,7 +1158,7 @@ def update_chef_profile(data: UpdateChefProfileRequest, db: Session = Depends(ge
         chef.full_name = data.full_name
     if data.kitchen_name:
         chef.kitchen_name = data.kitchen_name
-        chef.name = data.kitchen_name  # keep name in sync
+        chef.name = data.kitchen_name
     if data.phone:
         if db.query(Chef).filter(Chef.phone == data.phone, Chef.id != data.chef_id).first():
             raise HTTPException(status_code=400, detail="Phone already in use")
@@ -658,6 +1167,20 @@ def update_chef_profile(data: UpdateChefProfileRequest, db: Session = Depends(ge
         if db.query(Chef).filter(Chef.email == data.email, Chef.id != data.chef_id).first():
             raise HTTPException(status_code=400, detail="Email already in use")
         chef.email = data.email
+    
+    # New Fields
+    if data.area: chef.area = data.area
+    if data.city: chef.city = data.city
+    if data.state: chef.state = data.state
+    if data.pincode: chef.pincode = data.pincode
+    if data.pricing is not None: chef.pricing = data.pricing
+    if data.availability: chef.availability = data.availability
+    if data.service_radius is not None: chef.service_radius = data.service_radius
+    if data.opening_time: chef.opening_time = data.opening_time
+    if data.closing_time: chef.closing_time = data.closing_time
+    if data.specialities: chef.specialities = data.specialities
+    if data.fssai_number: chef.fssai_number = data.fssai_number
+
     if data.address:
         chef.address = data.address
     if data.bio:
@@ -669,7 +1192,14 @@ def update_chef_profile(data: UpdateChefProfileRequest, db: Session = Depends(ge
         chef.status = "online" if data.is_online else "offline"
     db.commit()
     db.refresh(chef)
-    return {"message": "Chef profile updated successfully", "full_name": chef.full_name, "kitchen_name": chef.kitchen_name, "email": chef.email, "phone": chef.phone}
+    return {
+        "message": "Chef profile updated successfully",
+        "full_name": chef.full_name,
+        "kitchen_name": chef.kitchen_name,
+        "email": chef.email,
+        "phone": chef.phone,
+        "fssai_number": chef.fssai_number
+    }
 
 # -------------------------
 # Root Endpoint
@@ -706,56 +1236,6 @@ def get_status(chef_id: int, db: Session = Depends(get_db)):
         "is_online": chef.is_online
     }
 
-from fastapi import Depends, HTTPException
-from sqlalchemy.orm import Session
-from .database import get_db
-from .models import Order, OrderItem, User, Address, Dish
-
-
-@app.get("/orders/{order_id}")
-def get_order_details(order_id: int, db: Session = Depends(get_db)):
-
-    order = db.query(Order).filter(Order.id == order_id).first()
-
-    if not order:
-        raise HTTPException(status_code=404, detail="Order not found")
-
-    user = db.query(User).filter(User.id == order.user_id).first()
-    address = db.query(Address).filter(Address.user_id == user.id).first()
-
-    items = (
-        db.query(OrderItem, Dish)
-        .join(Dish, OrderItem.dish_id == Dish.id)
-        .filter(OrderItem.order_id == order.id)
-        .all()
-    )
-
-    item_list = []
-    for item, dish in items:
-        item_list.append({
-            "dish_name": dish.name,
-            "quantity": item.quantity,
-            "price": item.price
-        })
-
-    return {
-        "order_id": order.id,
-        "status": order.status,
-        "total_amount": order.total_amount,
-        "created_at": order.created_at,
-
-        "customer": {
-            "name": user.full_name,
-            "phone": user.phone,
-            "email": user.email
-        },
-
-        "delivery_address": {
-            "address_line": address.address_line if address else None,
-            "city": address.city if address else None,
-            "latitude": address.latitude if address else None,
-            "longitude": address.longitude if address else None,
-        },
-
-        "items": item_list
-    }
+# NOTE: The duplicate /orders/{order_id} route that was here has been removed.
+# The correct implementation is defined above at the @app.get("/orders/{order_id}") route
+# which returns the full OrderDetailResponse with all timestamps.

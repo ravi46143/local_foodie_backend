@@ -6,11 +6,12 @@ from datetime import datetime
 # User Schemas
 # -----------------------------
 class CustomerRegister(BaseModel):
-    full_name: str = Field(..., min_length=3)
+    full_name: str = Field(..., pattern=r"^[A-Za-z ]+$", min_length=2)
     email: EmailStr
-    phone: str = Field(..., min_length=10, max_length=15)
+    phone: str = Field(..., pattern=r"^[0-9]{10}$")
     password: str = Field(..., min_length=6)
     confirm_password: str
+
 
 class CustomerResponse(BaseModel):
     id: int
@@ -79,6 +80,24 @@ class ChefBase(BaseModel):
     daily_meals: Optional[str] = None
     cuisine_type: Optional[str] = None
     food_category: Optional[str] = None
+    
+    # Detailed address
+    area: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+    pincode: Optional[str] = None
+
+    # Business details
+    pricing: float = 0.0
+    availability: Optional[str] = None
+    service_radius: float = 5.0
+    opening_time: Optional[str] = None
+    closing_time: Optional[str] = None
+    specialities: Optional[str] = None
+    fssai_number: Optional[str] = None
+    full_name: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
 
 class ChefResponse(ChefBase):
     id: int
@@ -89,17 +108,34 @@ class ChefResponse(ChefBase):
         from_attributes = True
 
 class ChefOnboard(BaseModel):
-    full_name: str = Field(..., min_length=3)
+    full_name: str = Field(..., pattern=r"^[A-Za-z ]+$", min_length=2)
     email: EmailStr
-    phone: str = Field(..., min_length=10, max_length=15)
+    phone: str = Field(..., pattern=r"^[0-9]{10}$")
     password: str = Field(..., min_length=6)
     confirm_password: str
+
     kitchen_name: str
     food_category: str
     cuisine_type: str
     experience: str
     daily_meals: str
     address: str
+    
+    # Detailed address
+    area: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+    pincode: Optional[str] = None
+
+    # Business details
+    pricing: float = 0.0
+    availability: Optional[str] = None
+    service_radius: float = 5.0
+    opening_time: Optional[str] = None
+    closing_time: Optional[str] = None
+    specialities: Optional[str] = None
+    fssai_number: Optional[str] = None
+
     latitude: float
     longitude: float
     image_url: Optional[str] = None
@@ -134,6 +170,12 @@ class OrderRatingRequest(BaseModel):
     rating: float
     comment: Optional[str] = None
 
+class OrderLocationUpdate(BaseModel):
+    latitude: float
+    longitude: float
+    estimated_arrival_minutes: Optional[int] = None
+    remaining_distance_km: Optional[float] = None
+
 # -----------------------------
 # Order Schemas
 # -----------------------------
@@ -151,15 +193,127 @@ class OrderItemResponse(OrderItemBase):
 class OrderCreate(BaseModel):
     chef_id: int
     items: List[OrderItemBase]
+    customer_note: Optional[str] = None # Fallback
+    special_instructions: Optional[str] = None
+    payment_method: Optional[str] = "COD"
+    address_id: Optional[int] = None
+    delivery_address: Optional[str] = None
+    landmark: Optional[str] = None
+    area: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+    pincode: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    customer_name: Optional[str] = None
+    customer_phone: Optional[str] = None
+    delivery_fee: Optional[float] = 0.0
+    platform_fee: Optional[float] = 0.0
+    package_fee: Optional[float] = 10.0
 
 class OrderResponse(BaseModel):
     id: int
     status: str
     total_amount: float
     created_at: datetime
+    updated_at: Optional[datetime] = None
+    accepted_at: Optional[datetime] = None
+    preparing_at: Optional[datetime] = None
+    out_for_delivery_at: Optional[datetime] = None
+    delivered_at: Optional[datetime] = None
     customer_rating: Optional[float] = None
     customer_note: Optional[str] = None
+    special_instructions: Optional[str] = None
+    payment_method: Optional[str] = "COD"
+    address_id: Optional[int] = None
+    delivery_address: Optional[str] = None
+    landmark: Optional[str] = None
+    area: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+    pincode: Optional[str] = None
+    customer_name: Optional[str] = None
+    customer_phone: Optional[str] = None
+    delivery_fee: Optional[float] = 0.0
+    platform_fee: Optional[float] = 0.0
+    package_fee: Optional[float] = 10.0
+    chef_earnings: Optional[float] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
     items: List[OrderItemResponse]
+    
+    # Real-time tracking
+    current_latitude: Optional[float] = None
+    current_longitude: Optional[float] = None
+    destination_latitude: Optional[float] = None
+    destination_longitude: Optional[float] = None
+    tracking_enabled: Optional[bool] = False
+    last_location_updated_at: Optional[datetime] = None
+    estimated_arrival_minutes: Optional[int] = None
+    remaining_distance_km: Optional[float] = None
+    ready_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+class CustomerDetail(BaseModel):
+    name: str
+    phone: str
+    email: str
+
+class AddressDetail(BaseModel):
+    address_line: Optional[str] = None
+    landmark: Optional[str] = None
+    area: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+    pincode: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+
+class OrderItemDetail(BaseModel):
+    dish_name: str
+    quantity: int
+    price: float
+
+class OrderDetailResponse(BaseModel):
+    id: int
+    status: str
+    total_amount: float
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+    accepted_at: Optional[datetime] = None
+    preparing_at: Optional[datetime] = None
+    out_for_delivery_at: Optional[datetime] = None
+    delivered_at: Optional[datetime] = None
+    customer: Optional[CustomerDetail] = None
+    delivery_address_obj: Optional[AddressDetail] = None
+    delivery_address: Optional[str] = None
+    items: List[OrderItemDetail] = []
+    customer_note: Optional[str] = None
+    special_instructions: Optional[str] = None
+    payment_method: Optional[str] = "COD"
+    address_id: Optional[int] = None
+    kitchen_name: Optional[str] = None
+    chef_phone: Optional[str] = None
+    delivery_fee: Optional[float] = 0.0
+    platform_fee: Optional[float] = 0.0
+    package_fee: Optional[float] = 10.0
+    chef_earnings: Optional[float] = None
+    customer_name: Optional[str] = None
+    customer_phone: Optional[str] = None
+    customer_email: Optional[str] = None
+    
+    # Real-time tracking fields
+    current_latitude: Optional[float] = None
+    current_longitude: Optional[float] = None
+    destination_latitude: Optional[float] = None
+    destination_longitude: Optional[float] = None
+    tracking_enabled: Optional[bool] = False
+    last_location_updated_at: Optional[datetime] = None
+    estimated_arrival_minutes: Optional[int] = None
+    remaining_distance_km: Optional[float] = None
+    ready_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -186,6 +340,18 @@ class AddressResponse(AddressBase):
 
     class Config:
         from_attributes = True
+
+# Wrapper to match Android GenericAddressResponse (val success: Boolean, val message: String, val address: AddressResponse?)
+class GenericAddressResponse(BaseModel):
+    success: bool
+    message: str
+    address: Optional[AddressResponse] = None
+
+# Wrapper for list response
+class GenericAddressListResponse(BaseModel):
+    success: bool
+    message: str
+    addresses: List[AddressResponse] = []
 
 # -----------------------------
 # Review Schemas
@@ -255,16 +421,60 @@ class ResetPasswordRequest(BaseModel):
 # -----------------------------
 class UpdateCustomerProfileRequest(BaseModel):
     user_id: int
-    full_name: Optional[str] = None
-    phone: Optional[str] = None
+    full_name: Optional[str] = Field(None, pattern=r"^[A-Za-z ]+$")
+    phone: Optional[str] = Field(None, pattern=r"^[0-9]{10}$")
     email: Optional[EmailStr] = None
+
 
 class UpdateChefProfileRequest(BaseModel):
     chef_id: int
-    full_name: Optional[str] = None
-    phone: Optional[str] = None
+    full_name: Optional[str] = Field(None, pattern=r"^[A-Za-z ]+$")
+    area: Optional[str] = None
+    city: Optional[str] = None
+    state: Optional[str] = None
+    pincode: Optional[str] = None
+    pricing: Optional[float] = None
+    availability: Optional[str] = None
+    service_radius: Optional[float] = None
+    opening_time: Optional[str] = None
+    closing_time: Optional[str] = None
+    specialities: Optional[str] = None
+    fssai_number: Optional[str] = None
+    is_online: Optional[bool] = None
+    phone: Optional[str] = Field(None, pattern=r"^[0-9]{10}$")
     email: Optional[EmailStr] = None
-    kitchen_name: Optional[str] = None
+    kitchen_name: Optional[str] = Field(None, pattern=r"^[A-Za-z ]+$")
     address: Optional[str] = None
     bio: Optional[str] = None
     image_url: Optional[str] = None
+
+# -----------------------------
+# Cart Schemas
+# -----------------------------
+class CartItemCreate(BaseModel):
+    dish_id: int
+    quantity: int = 1
+
+class CartItemUpdate(BaseModel):
+    quantity: int
+
+class CartItemResponse(BaseModel):
+    id: int
+    dish_id: int
+    dish_name: str
+    quantity: int
+    price: float
+    image_url: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+class CartResponse(BaseModel):
+    user_id: int
+    items: List[CartItemResponse]
+    total_amount: float
+
+class AddToCartRequest(BaseModel):
+    user_id: int
+    dish_id: int
+    quantity: int = 1
